@@ -124,7 +124,7 @@ process mungeGWAS {
     label "process_high"
     tag "$gwas_file"
     publishDir "${params.outdir}/processed", mode: 'copy'
-    
+    errorStrategy 'ignore' //continue on error 
     
     input:
     tuple val(meta), path(gwas_file), val(genome_build)
