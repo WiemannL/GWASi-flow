@@ -161,10 +161,9 @@ process mungeGWAS {
         inputFile,
         save_path = outputFile,
         ref_genome = genome_build,
-        force_new = TRUE,
-        impute_beta_se = TRUE, 
-        compute_z = TRUE, 
-        standardise_headers = TRUE
+        force_new = TRUE, 
+        compute_z = TRUE 
+        
     )
 
     if(genome_build != "GRCh38") {
