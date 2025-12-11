@@ -1,25 +1,18 @@
 #!/usr/bin/env nextflow
 
 /*
- * MTAG-flow - A Nextflow pipeline for GWAS data ingestion and MTAG processing
+ * GWASi-flow - A Nextflow pipeline for GWAS data ingestion and processing
  */
 
 // Default parameters
-params.samples = params.samples ?: "samples.csv"
-params.outdir  = params.outdir  ?: "results"
-params.mtag_script = params.mtag_script ?: "mtag.py"
-
-params.snp = "SNP"
-params.a1  = "A1"
-params.a2  = "A2"
-params.z   = "Z"
-params.n   = "N"
-params.maf_min = 0.01
+params.gwas_url = null
+params.gwas_csv = null
+params.outdir = 'results'
 
 log.info """\
-         MTAG-flow - pairwise MTAG PIPELINE
+         GWASi-flow - GWAS INGESTION PIPELINE
          ===================================
-         GWAS CSV     : ${params.samples}
+         GWAS CSV     : ${params.gwas_csv}
          Output dir   : ${params.outdir}
          """
          .stripIndent()
@@ -29,57 +22,292 @@ if (params.gwas_csv == null) {
     error "Please provide a CSV file with GWAS information using --gwas_csv"
 }
 
-//Read CSV file
-Channel
-    .fromPath(params.samples)
-    .splitCsv(header:true)
-    .set { sample_rows }
-
-
-// Create tuple for each MTAG pairing
-pairwise_inputs = sample_rows.map { row ->
-
-    def brain_name = row.brain_gwas.replaceAll(/.*\//,'').replace('.txt','')
-
-    tuple(
-        row.inflammation_gwas,
-        row.brain_gwas,
-        "${params.outdir}/${brain_name}_MTAG"
-    )
-}
-
-
-process RUN_MTAG {
-
-    tag { outprefix }
-
+// Process 1: Download GWAS file from URL
+process downloadGWAS {
+    label "process_low"
+    tag "$gwas" 
+    publishDir "${params.outdir}/raw", mode: 'copy'
+    
     input:
-    tuple val(infl_gwas),
-          val(brain_gwas),
-          val(outprefix)
-
+    tuple val(gwas), val(year), val(url)
+    
     output:
-    file("${outprefix}*") into mtag_results
-
+    tuple val(meta), path("${gwas}_raw.txt"), emit: gwas_raw
+    
+    exec:
+    meta = [gwas: gwas, year: year]
+    
     script:
     """
-    run_mtag.sh \
-        ${params.mtag_script} \
-        "${infl_gwas},${brain_gwas}" \
-        ${outprefix} \
-        ${params.snp} \
-        ${params.a1} \
-        ${params.a2} \
-        ${params.z} \
-        ${params.n} \
-        ${params.maf_min}
+    # Download the file from URL
+    echo "Downloading from URL: ${url}"
+    wget -O downloaded_file "${url}"
+    
+    # Determine file type and decompress if needed
+    if file downloaded_file | grep -q gzip; then
+        echo "Decompressing gzip file"
+        gzip -dc downloaded_file > "${gwas}_raw.txt"
+    elif file downloaded_file | grep -q zip; then
+        echo "Extracting zip file"
+        unzip -p downloaded_file > "${gwas}_raw.txt"
+    elif file downloaded_file | grep -q bzip2; then
+        echo "Decompressing bzip2 file"
+        bzip2 -dc downloaded_file > "${gwas}_raw.txt"
+    elif [[ "${url}" == *.gz ]]; then
+        echo "URL has .gz extension, forcing gzip decompression"
+        gzip -dc downloaded_file > "${gwas}_raw.txt" || cp downloaded_file "${gwas}_raw.txt"
+    else
+        echo "Using file as-is"
+        cp downloaded_file "${gwas}_raw.txt"
+    fi
+    
+    # Verify output file exists
+    if [ -s "${gwas}_raw.txt" ]; then
+        echo "Successfully created output file"
+    else
+        echo "Warning: Output file may be empty"
+    fi
     """
 }
 
-workflow {
-    RUN_MTAG(pairwise_inputs)
+// Process 2: Stage local GWAS file (runs locally without container)
+process stageGWAS {
+    label "process_single"
+    tag "$gwas"  // Tag process with GWAS name for easier tracking
+    publishDir "${params.outdir}/raw", mode: 'copy'
+    executor 'local'  // Force execution on local machine
+    container null    // Disable container for this process
+    
+    input:
+    tuple val(gwas), val(year), path(local_file)  // Using path type for proper file staging
+    
+    output:
+    tuple val(meta), path("${gwas}_raw.txt"), emit: gwas_raw
+    
+    exec:
+    meta = [gwas: gwas, year: year]
+    
+    script:
+    """
+    # Process local file
+    echo "Staging local file: ${local_file}"
+    
+    # More robust file type detection and decompression
+    if file "${local_file}" | grep -q gzip; then
+        echo "Detected gzip file, decompressing..."
+        gzip -cd "${local_file}" > "${gwas}_raw.txt"
+    elif file "${local_file}" | grep -q zip; then
+        echo "Detected zip file, extracting..."
+        unzip -p "${local_file}" > "${gwas}_raw.txt"
+    elif file "${local_file}" | grep -q bzip2; then
+        echo "Detected bzip2 file, decompressing..."
+        bzip2 -cd "${local_file}" > "${gwas}_raw.txt"
+    elif [[ "${local_file}" == *.gz || "${local_file}" == *.gzip ]]; then
+        echo "Filename has .gz extension, forcing gzip decompression"
+        gzip -cd "${local_file}" > "${gwas}_raw.txt" || cp "${local_file}" "${gwas}_raw.txt"
+    else
+        echo "Assuming uncompressed file, copying directly..."
+        cp "${local_file}" "${gwas}_raw.txt"
+    fi
+    
+    # Verify output file exists
+    if [ -s "${gwas}_raw.txt" ]; then
+        echo "Successfully created output file"
+    else
+        echo "Warning: Output file may be empty"
+    fi
+    """
 }
 
+// Process 2: Munge GWAS file using MungeSumstats
+process mungeGWAS {
+    label "process_high"
+    tag "$gwas_file"
+    publishDir "${params.outdir}/processed", mode: 'copy'
+    errorStrategy 'ignore' //continue on error 
+    
+    input:
+    tuple val(meta), path(gwas_file), val(genome_build)
+    
+    output:
+    tuple val(meta), path("${meta.gwas}_processed*.txt"), emit: gwas_processed
+    
+    script:
+    """
+    #!/usr/bin/env Rscript
+    
+    # Load required libraries
+    library(data.table)
+    
+    # Set variables
+    genome_build <- "${genome_build}"
+    inputFile <- "${gwas_file}"
+    outputFile <- paste0("${meta.gwas}_processed", genome_build, ".txt")
+    
+    # Check if the file has headers to convert
+    cat("Checking file headers for standardization...\n")
+    
+    # Read first few lines to check headers (efficient for large files)
+    fileHeader <- fread(inputFile, nrows = 1, fill = TRUE, verbose = TRUE)
+    columnNames <- names(fileHeader)
+    
+    # Print original column names
+    cat("Original column names:", paste(columnNames, collapse = ", "), "\\n")
 
+    # Process with MungeSumstats directly
+    cat("Processing with MungeSumstats...\\n")
+    cat("Build is: ", genome_build, "\\n" )
+    MungeSumstats::format_sumstats(
+        inputFile,
+        save_path = outputFile,
+        ref_genome = genome_build,
+        force_new = TRUE, 
+        compute_z = TRUE 
+        
+    )
 
+    if(genome_build != "GRCh38") {
 
+        new_outputFile <- paste0("${meta.gwas}_processed", "GRCh38", ".txt")
+       message("Warning: Genome build is not GRCh38, please ensure compatibility with your analysis.\\n")
+        MungeSumstats::format_sumstats(
+            outputFile,
+            save_path = new_outputFile,
+            force_new = TRUE,
+            convert_ref_genome = "GRCh38"
+        )
+
+        #now remove the old file
+        file.remove(outputFile)
+        message("Removed old file: ", outputFile)
+        
+        # Update outputFile to point to the new GRCh38 file
+        outputFile <- new_outputFile
+    }
+    
+    # Custom Beta and SE imputation if both are missing
+    cat("Checking for Beta and SE columns and imputing if missing...\\n")
+    
+    # Read the processed file
+    processed_data <- fread(outputFile)
+    
+    # Check if Beta and SE are missing
+    has_beta <- "BETA" %in% names(processed_data)
+    has_se <- "SE" %in% names(processed_data)
+    
+    if (!has_beta && !has_se) {
+        cat("Both BETA and SE are missing. Calculating from Z-score and other available data...\\n")
+        
+        # Check required columns
+        required_cols <- c("Z", "N", "FRQ")
+        missing_cols <- required_cols[!required_cols %in% names(processed_data)]
+        
+        if (length(missing_cols) == 0) {
+            # Calculate MAF (Minor Allele Frequency)
+            processed_data[, MAF := pmin(FRQ, 1 - FRQ)]
+            
+            # Calculate SE first: SE = 1 / sqrt(N * 2 * MAF * (1-MAF))
+            processed_data[, SE := 1 / sqrt(N * 2 * MAF * (1 - MAF))]
+            
+            # Calculate Beta: Beta = Z * SE
+            processed_data[, BETA := Z * SE]
+            
+            # Remove temporary MAF column
+            processed_data[, MAF := NULL]
+            
+            cat("Successfully calculated BETA and SE from Z-score, N, and frequency\\n")
+            
+            # Write back to file
+            fwrite(processed_data, outputFile, sep = "\\t")
+            cat("Updated file with BETA and SE columns\\n")
+            
+        } else {
+            cat("Cannot calculate BETA and SE. Missing required columns:", paste(missing_cols, collapse = ", "), "\\n")
+            cat("Available columns:", paste(names(processed_data), collapse = ", "), "\\n")
+        }
+        
+    } else if (!has_beta && has_se) {
+        cat("BETA missing but SE available. Calculating BETA = Z * SE\\n")
+        if ("Z" %in% names(processed_data)) {
+            processed_data[, BETA := Z * SE]
+            fwrite(processed_data, outputFile, sep = "\\t")
+            cat("Successfully calculated BETA from Z and SE\\n")
+        } else {
+            cat("Cannot calculate BETA: Z column missing\\n")
+        }
+        
+    } else if (has_beta && !has_se) {
+        cat("SE missing but BETA available. Calculating SE = |BETA| / |Z|\\n")
+        if ("Z" %in% names(processed_data)) {
+            processed_data[, SE := abs(BETA) / abs(Z)]
+            fwrite(processed_data, outputFile, sep = "\\t")
+            cat("Successfully calculated SE from BETA and Z\\n")
+        } else {
+            cat("Cannot calculate SE: Z column missing\\n")
+        }
+        
+    } else {
+        cat("Both BETA and SE are already present. No imputation needed.\\n")
+    }
+    """
+}
+
+// Workflow definition
+workflow {
+    // Read CSV file and split into two channels: one for URLs and one for local files
+    Channel
+        .fromPath(params.gwas_csv)
+        .splitCsv(header: true, strip: true)  // Strip whitespace
+        .map { row ->
+            def gwas = row.GWAS?.trim()
+            def year = row.year?.trim()
+            def source = row.path?.trim() ?: row.URL?.trim() // Support both 'path' and 'URL' for backward compatibility
+            def genome_build = row.genome_build?.trim()
+            
+            // Validate genome_build
+            if (!genome_build || !(genome_build in ['GRCh38', 'GRCh37'])) {
+                error "Invalid or missing genome_build '${genome_build}' for GWAS '${gwas}'. Must be either 'GRCh38' or 'GRCh37'"
+            }
+            
+            // Log what we're processing
+            log.info "Processing row: GWAS=${gwas}, year=${year}, genome_build=${genome_build}, path=${source}"
+            
+            // Return a tuple with GWAS name, year, source, genome_build, and whether it's a local file
+            [gwas, year, source, genome_build, (source ==~ /^\\/.*/ || source ==~ /^\\.\\/.*/ || source ==~ /^\\.\\.\\/.*/)]
+        }
+        .branch {
+            local: it[4] == true    // Local file path
+            remote: it[4] == false  // URL to download
+        }
+        .set { input_ch }
+    
+    // Create channels for download and stage processes
+    download_ch = input_ch.remote.map { it[0..2] }  // Just keep gwas, year, url
+    stage_ch = input_ch.local.map { it[0..2] }      // Just keep gwas, year, path
+    
+    // Process URLs through downloadGWAS
+    downloadGWAS(download_ch)
+    
+    // Process local files through stageGWAS
+    stageGWAS(stage_ch)
+    
+    // Merge the outputs from both processes for mungeGWAS
+    gwas_files_ch = downloadGWAS.out.gwas_raw.mix(stageGWAS.out.gwas_raw)
+    
+    // Create a channel with genome_build information keyed by GWAS name
+    genome_build_ch = input_ch.remote.mix(input_ch.local)
+        .map { gwas, year, source, genome_build, is_local ->
+            [gwas, genome_build]
+        }
+    
+    // Join the channels to combine gwas files with their genome builds
+    // gwas_files_ch emits: [meta, gwas_file] where meta = [gwas: gwas, year: year]
+    // genome_build_ch emits: [gwas, genome_build]
+    mungeGWAS_input = gwas_files_ch
+        .map { meta, gwas_file -> [meta.gwas, meta, gwas_file] }  // Restructure to key by gwas name
+        .join(genome_build_ch, by: 0)  // Join on gwas name
+        .map { gwas, meta, gwas_file, genome_build -> [meta, gwas_file, genome_build] }  // Restructure for mungeGWAS
+    
+    // Process all files with mungeGWAS
+    mungeGWAS(mungeGWAS_input)
+}
